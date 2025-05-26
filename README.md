@@ -5,3 +5,6 @@ Core Dependency
 - **Python**: 3.8.16
 - **PyTorch**: 2.0.1 (GPU version)
 - **PyTorch Geometric**: 2.6.1
+
+Contact: 
+Zheyi li:12325137@zju.edu.cn
