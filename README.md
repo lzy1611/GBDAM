@@ -3,5 +3,5 @@ Includes coordinate transformation, data generation, abaqus modeling and post-pr
 
 Core Dependency
 - **Python**: 3.8.16
--PyTorch: 2.0.1 (GPU version)
+- **PyTorch**: 2.0.1 (GPU version)
 - **PyTorch Geometric**: 2.6.1
