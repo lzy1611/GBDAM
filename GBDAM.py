@@ -134,8 +134,8 @@ class BendingDataset(Dataset):
         return inverse_data
 
 start_time = time.time()
-root_job_dir = r'.\data\job'
-root_cross_section_dir = r'.\data\cross_section'
+root_job_dir = r'.data/job'
+root_cross_section_dir = r'.data/cross_section'
 dataset = BendingDataset(root_job_dir, root_cross_section_dir)
 def custom_collate_fn(batch):
     encoder_inputs, lstm_labels, original_labels, num_bends = zip(*batch)
@@ -162,16 +162,6 @@ def custom_collate_fn(batch):
     return encoder_inputs_tensor, lstm_labels_tensor, original_labels_tensor, max_num_bends
 
 
-# seed_value = 21
-# random.seed(seed_value)
-# np.random.seed(seed_value)
-# torch.manual_seed(seed_value)
-# if torch.cuda.is_available():
-#     torch.cuda.manual_seed(seed_value)
-#     torch.cuda.manual_seed_all(seed_value)
-#     torch.backends.cudnn.deterministic = True
-#     torch.backends.cudnn.benchmark = False
-
 dataloader = DataLoader(dataset, batch_size=96, shuffle=True, collate_fn=custom_collate_fn)
 train_ratio = 0.8
 val_ratio = 1 - train_ratio
@@ -181,7 +171,6 @@ dataset_length = len(dataset)
 train_length = int(train_ratio * dataset_length)
 val_length = dataset_length - train_length
 
-#train_dataset, val_dataset = random_split(dataset, [train_length, val_length], generator=torch.Generator().manual_seed(seed_value))#random seed
 train_dataset, val_dataset = random_split(dataset, [train_length, val_length])
 
 train_dataloader = DataLoader(train_dataset, batch_size=200, shuffle=True, collate_fn=custom_collate_fn)
@@ -282,16 +271,19 @@ class MixingMatrixInit(Enum):
     ALL_ONES = 2
     UNIFORM = 3
 
+
 class MultiHeadAttention(nn.Module):
     def __init__(
         self,
         d_model: int,
         nhead: int,
         output_attentions: bool = True,
-        attention_probs_dropout_prob: float = 0.1,
+        attention_probs_dropout_prob: float = 0.0,
         use_dense_layer: bool = True,
         use_layer_norm: bool = False,
         mixing_initialization: MixingMatrixInit = MixingMatrixInit.UNIFORM,
+        max_window_size: int = 3,  # Maximum window size for local attention
+        max_rel_pos: int = 3,  # Maximum relative position for gating
     ):
         super(MultiHeadAttention, self).__init__()
         assert d_model % nhead == 0, "d_model must be divisible by nhead"
@@ -304,48 +296,110 @@ class MultiHeadAttention(nn.Module):
         self.mixing_initialization = mixing_initialization
         self.use_dense_layer = use_dense_layer
         self.use_layer_norm = use_layer_norm
+        self.max_window_size = max_window_size
+        self.max_rel_pos = max_rel_pos
 
-        self.Wq = nn.Linear(d_model, d_model, bias=False)
-        self.Wk = nn.Linear(d_model, d_model, bias=False)
-        self.Wv = nn.Linear(d_model, d_model, bias=False)
+        # Shared query and key projection
+        self.Wq = nn.Linear(d_model, d_model, bias=False)  # Shared query projection
+        self.Wk = nn.Linear(d_model, d_model, bias=False)  # Shared key projection
+        self.Wv = nn.ModuleList([
+            nn.Linear(d_model, self.head_dim, bias=False)
+            for _ in range(nhead)
+        ])
+
+        # Content bias for attention scores
         self.content_bias = nn.Linear(d_model, nhead, bias=False)
+
+        # Mixing matrix for collaborative heads
         self.mixing = self.init_mixing_matrix()
 
         self.dense = nn.Linear(d_model, d_model) if use_dense_layer else nn.Sequential()
         self.dropout = nn.Dropout(attention_probs_dropout_prob)
 
+        self.rel_pos_embeddings = nn.Embedding(2 * max_rel_pos + 1, nhead)
+
         if use_layer_norm:
             self.layer_norm = nn.LayerNorm(d_model)
 
-    def forward(
-        self,
-        x,
-        attention_mask=None,
-        head_mask=None,
-    ):
+    def forward(self, x, attention_mask=None, head_mask=None):
+        # Ensure all tensors are on the same device
+        device = x.device
+
+        # Query, Key, Value projections
         Q = self.Wq(x).view(x.size(0), x.size(1), self.nhead, self.head_dim).transpose(1, 2)
         K = self.Wk(x).view(x.size(0), x.size(1), self.nhead, self.head_dim).transpose(1, 2)
-        V = self.Wv(x).view(x.size(0), x.size(1), self.nhead, self.head_dim).transpose(1, 2)
-        assert self.mixing.shape == (self.nhead, self.head_dim), f"Mixing matrix shape mismatch: {self.mixing.shape} != ({self.nhead}, {self.head_dim})"
+        #V = self.Wv(x).view(x.size(0), x.size(1), self.nhead, self.head_dim).transpose(1, 2)
+        # 前向传播
+        V_heads = []
+        for i in range(self.nhead):
+            V_head = self.Wv[i](x)  # [batch, seq_len, head_dim]
+            V_heads.append(V_head)
+        V = torch.stack(V_heads, dim=1)  # [batch, nhead, seq_len, head_dim]
+
+        # Apply dynamic mixing matrix for collaborative heads
         mixed_Q = Q * self.mixing.unsqueeze(0).unsqueeze(-2)
+
+        # Create dynamic local attention mask based on the sequence length
+        seq_len = x.size(1)
+        local_mask = self.create_local_attention_mask(seq_len)
+
+        # Calculate relative position embeddings for gating
+        rel_pos = self.calculate_relative_positions(seq_len).to(device)
+        rel_pos_emb = self.rel_pos_embeddings(rel_pos).to(device)  # Ensure relative position embeddings are on the same device
+
+        # Calculate attention scores
         attn_scores = torch.matmul(mixed_Q, K.transpose(-2, -1)) / math.sqrt(self.head_dim)
+        rel_pos_emb = rel_pos_emb.permute(2, 0, 1).unsqueeze(0)
+        attn_scores = attn_scores + rel_pos_emb
+        attn_scores = attn_scores + local_mask# Apply the local attention mask
+
+
+        # Apply content bias
         content_bias = self.content_bias(x).transpose(1, 2).unsqueeze(-2)
         attn_scores += content_bias
+
+        # Apply attention mask if provided
         if attention_mask is not None:
             attn_scores = attn_scores + attention_mask
+
+        # Calculate attention weights
         attn_weights = torch.softmax(attn_scores, dim=-1)
         attn_weights = self.dropout(attn_weights)
+
         if head_mask is not None:
             attn_weights = attn_weights * head_mask
+
+        # Compute the output of the attention mechanism
         attn_output = torch.matmul(attn_weights, V)
         attn_output = attn_output.transpose(1, 2).contiguous().view(x.size(0), x.size(1), self.d_model)
         attn_output = self.dense(attn_output)
+
+        # Apply layer normalization if specified
         if self.use_layer_norm:
             attn_output = self.layer_norm(x + attn_output)
+
         if self.output_attentions:
             return (attn_output, attn_weights)
         else:
             return (attn_output,)
+
+    def create_local_attention_mask(self, seq_len):
+        """
+        Create a local attention mask for each token that limits its attention to its local context.
+        """
+        mask = torch.full((seq_len, seq_len), -10000.0).to(device)
+        for i in range(seq_len):
+            start = max(0, i - self.max_window_size)
+            end = min(seq_len, i + self.max_window_size + 1)
+            mask[i, start:end] = 0
+        return mask
+
+    def calculate_relative_positions(self, seq_len):
+        """Calculate relative positions between tokens."""
+        positions = torch.arange(seq_len, dtype=torch.long)
+        relative_positions = positions.unsqueeze(0) - positions.unsqueeze(1)
+        relative_positions = relative_positions.clamp(-self.max_rel_pos, self.max_rel_pos)
+        return relative_positions + self.max_rel_pos  # Shift to positive indices
 
     def init_mixing_matrix(self, scale=0.2):
         mixing = torch.zeros(self.nhead, self.head_dim)
@@ -353,7 +407,7 @@ class MultiHeadAttention(nn.Module):
         if self.mixing_initialization is MixingMatrixInit.CONCATENATE:
             dim_head = int(math.ceil(self.head_dim / self.nhead))
             for i in range(self.nhead):
-                mixing[i, i * dim_head : (i + 1) * dim_head] = 1.0
+                mixing[i, i * dim_head: (i + 1) * dim_head] = 1.0
         elif self.mixing_initialization is MixingMatrixInit.ALL_ONES:
             mixing.fill_(1.0)
         elif self.mixing_initialization is MixingMatrixInit.UNIFORM:
@@ -365,6 +419,8 @@ class MultiHeadAttention(nn.Module):
                 )
             )
         return nn.Parameter(mixing)
+
+
 
 def drop_edge(edge_index, p):
     num_edges = edge_index.size(1)
@@ -657,7 +713,7 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
 num_runs = 1
-num_epochs = 500
+num_epochs = 1000
 
 
 final_results = []
